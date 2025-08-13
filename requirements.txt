@@ -1,0 +1,23 @@
+# --- ASGI & API ---
+fastapi>=0.110
+uvicorn[standard]>=0.23
+
+# --- DB ---
+SQLAlchemy>=2.0
+psycopg2-binary>=2.9
+
+# --- Validation ---
+pydantic>=2.6
+
+# --- Data/Math ---
+pandas>=2.0
+numpy>=1.26
+
+# --- Graph & Geo ---
+networkx>=3.0
+shapely>=2.0
+pyproj>=3.6
+
+# --- Optional (속도/시각화) ---
+scipy>=1.10       # cKDTree 가속 (없어도 동작)
+folium>=0.15      # 지도로 시각화할 때만 사용
