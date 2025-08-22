@@ -1,4 +1,4 @@
-# 도심융합특구 침수 예측 모델 API
+# 도심융합특구 시뮬레이션 모델 API
 ## Project
 ### Workplace Structure
 ```
