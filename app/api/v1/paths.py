@@ -1,11 +1,10 @@
-# app/api/v1/paths.py  # 기존 파일 교체
-
+# app/api/v1/paths.py
 from __future__ import annotations
 
 import math
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import networkx as nx
 import numpy as np
@@ -13,7 +12,7 @@ import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from shapely import wkt as _wkt
 from shapely.geometry import LineString, Point
-from sqlalchemy import and_, func, select, text
+from sqlalchemy import select, and_, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from pyproj import Transformer
@@ -24,31 +23,22 @@ from app.schemas import PathCreate, PathOut, PathType
 
 router = APIRouter()
 
-# ------------------------------------------------------------------------------------
-# 환경 변수 / 상수
-# ------------------------------------------------------------------------------------
-UROAD_TABLE = os.getenv("UROAD_SOURCE_TABLE", "new_uroad")  # 링크 원천 테이블(라인스트링)
+UROAD_TABLE = os.getenv("UROAD_SOURCE_TABLE", "new_uroad")
 SRID_WGS84 = int(os.getenv("SRID_WGS84", "4326"))
-SRID_METRIC = int(os.getenv("SRID_METRIC", "5179"))  # 미터 좌표계(EPSG:5179 권장)
-SANITY_MAX_M = float(os.getenv("SNAP_SANITY_MAX_M", "2000"))  # 좌표-도로 최근접 허용 최대치(m)
-BBOX_BUFFER_M = float(os.getenv("BBOX_BUFFER_M", "12000"))    # 출발/도착 주변 BBOX 버퍼(m)
+SRID_METRIC = int(os.getenv("SRID_METRIC", "5179"))
+SANITY_MAX_M = int(os.getenv("SNAP_SANITY_MAX_M", "2000"))
+BBOX_BUFFER_M = float(os.getenv("BBOX_BUFFER_M", "12000"))
 
-# ID 범위 정책(기존 요구사항 유지)
-EXIST_MIN, EXIST_MAX = 600_000_000, 630_000_000  # [min, max)
+EXIST_MIN, EXIST_MAX = 600_000_000, 630_000_000
 SHORTEST_MIN, SHORTEST_MAX = 630_000_000, 660_000_000
 OPTIMAL_MIN, OPTIMAL_MAX = 660_000_000, 690_000_000
 
-
-# ------------------------------------------------------------------------------------
-# ID 발급/조회
-# ------------------------------------------------------------------------------------
 def _range_for(ptype: PathType) -> Tuple[int, int]:
     if ptype == "existing":
         return EXIST_MIN, EXIST_MAX
     if ptype == "shortest":
         return SHORTEST_MIN, SHORTEST_MAX
     return OPTIMAL_MIN, OPTIMAL_MAX
-
 
 def _next_path_id(db: Session, ptype: PathType) -> int:
     lo, hi = _range_for(ptype)
@@ -57,9 +47,8 @@ def _next_path_id(db: Session, ptype: PathType) -> int:
     ).scalar()
     nxt = lo if max_id is None else int(max_id) + 1
     if nxt >= hi:
-        raise HTTPException(status_code=409, detail=f"{ptype} path_id capacity exhausted")
+        raise HTTPException(status_code=409, detail="path_id가 초과되었습니다.")
     return nxt
-
 
 def _find_path(db: Session, start_id: int, end_id: int, ptype: PathType) -> Optional[Path]:
     lo, hi = _range_for(ptype)
@@ -80,21 +69,16 @@ def _find_path(db: Session, start_id: int, end_id: int, ptype: PathType) -> Opti
         .first()
     )
 
-
-# ------------------------------------------------------------------------------------
-# 좌표 변환
-# ------------------------------------------------------------------------------------
 def _to_xy(lon: float, lat: float, transformer: Transformer) -> Tuple[float, float]:
-    x, y = transformer.transform(lon, lat)  # always_xy=True
+    x, y = transformer.transform(lon, lat)
     return float(x), float(y)
-
 
 def make_bbox_metric_around(
     origin_lon: float,
     origin_lat: float,
     dest_lon: float,
     dest_lat: float,
-    buffer_m: float = BBOX_BUFFER_M,
+    buffer_m: float = BBOX_BUFFER_M
 ) -> Tuple[float, float, float, float]:
     to_metric = Transformer.from_crs(SRID_WGS84, SRID_METRIC, always_xy=True)
     ox, oy = _to_xy(origin_lon, origin_lat, to_metric)
@@ -105,10 +89,6 @@ def make_bbox_metric_around(
     ymax = max(oy, dy) + buffer_m
     return xmin, xmax, ymin, ymax
 
-
-# ------------------------------------------------------------------------------------
-# 링크 로드(new_uroad 등)
-# ------------------------------------------------------------------------------------
 def _get_single_srid(engine, tbl: str) -> int:
     with engine.begin() as conn:
         df = pd.read_sql(f"SELECT DISTINCT ST_SRID(geometry) AS srid FROM {tbl}", conn)
@@ -121,13 +101,12 @@ def _get_single_srid(engine, tbl: str) -> int:
         raise ValueError(f"{tbl}: geometry SRID=0 (미지정)")
     return int(srids[0])
 
-
 def load_links_from_postgis(
     engine,
     table: str = UROAD_TABLE,
     schema: Optional[str] = None,
     srid_metric: int = SRID_METRIC,
-    bbox_metric: Optional[Tuple[float, float, float, float]] = None,  # (xmin,xmax,ymin,ymax)
+    bbox_metric: Optional[Tuple[float, float, float, float]] = None,
 ) -> pd.DataFrame:
     tbl = table if schema is None else f"{schema}.{table}"
     src_srid = _get_single_srid(engine, tbl)
@@ -136,26 +115,26 @@ def load_links_from_postgis(
     where = ""
     if bbox_metric is not None:
         xmin, xmax, ymin, ymax = bbox_metric
-        where = f"""
+        where = F"""
         WHERE ST_Intersects(
-          {geom_expr},
-          ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, {srid_metric})
+            {geom_expr},
+            ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, {srid_metric})
         )
         """
 
     sql = f"""
     SELECT
-      "LINK_ID","F_NODE","T_NODE",
-      COALESCE("MAX_SPD", NULL) AS max_spd,
-      COALESCE("ROAD_RANK", NULL) AS road_rank,
-      COALESCE("ROAD_TYPE", NULL) AS road_type,
-      COALESCE("LANES", NULL)    AS lanes,
-      ST_AsText({geom_expr}) AS wkt_5179,
-      ST_Length({geom_expr}) AS length_m,
-      ST_X(ST_StartPoint({geom_expr})) AS start_x,
-      ST_Y(ST_StartPoint({geom_expr})) AS start_y,
-      ST_X(ST_EndPoint({geom_expr}))   AS end_x,
-      ST_Y(ST_EndPoint({geom_expr}))   AS end_y
+        "LINK_ID", "F_NODE", "T_NODE",
+        COALESCE("MAX_SPD", NULL) AS max_spd,
+        COALESCE("ROAD_RANK", NULL) AS road_rank,
+        COALESCE("ROAD_TYPE", NULL) AS road_type,
+        COALESCE("LANES", NULL) AS lanes,
+        ST_AsText({geom_expr}) AS wkt_5179,
+        ST_Length({geom_expr}) AS length_m,
+        ST_X(ST_StartPoint({geom_expr})) AS start_x,
+        ST_Y(ST_StartPoint({geom_expr})) AS start_y,
+        ST_X(ST_EndPoint({geom_expr}))   AS end_x,
+        ST_Y(ST_EndPoint({geom_expr}))   AS end_y
     FROM {tbl}
     {where};
     """
@@ -164,18 +143,13 @@ def load_links_from_postgis(
     df["geom"] = df["wkt_5179"].apply(_wkt.loads)
     return df
 
-
-# ------------------------------------------------------------------------------------
-# 그래프 구성 및 라우팅
-# ------------------------------------------------------------------------------------
 @dataclass
 class GraphConfig:
     use_time_weight: bool = False
     default_speed_kmh: float = 40.0
     length_col: str = "length_m"
     max_spd_col: str = "max_spd"
-    enable_penalty: bool = False  # True면 도로등급/차로 페널티 적용
-
+    enable_penalty: bool = False
 
 def _road_penalty(row) -> float:
     f = 1.0
@@ -184,23 +158,12 @@ def _road_penalty(row) -> float:
         if rr is not None and not (pd.isna(rr)):
             rr = int(rr)
             if rr <= 3:
-                f *= 0.85  # 상위도로 선호
+                f *= 0.85
             elif rr >= 7:
-                f *= 1.20  # 이면도로 기피
-    except Exception:
-        pass
-    lanes = getattr(row, "lanes", None)
-    try:
-        if lanes is not None and not (pd.isna(lanes)):
-            lanes = float(lanes)
-            if lanes >= 3:
-                f *= 0.95
-            elif lanes < 2:
-                f *= 1.15
+                f *= 1.20
     except Exception:
         pass
     return f
-
 
 def build_graph(links: pd.DataFrame, cfg: GraphConfig = GraphConfig()) -> nx.MultiDiGraph:
     G = nx.MultiDiGraph()
@@ -219,14 +182,11 @@ def build_graph(links: pd.DataFrame, cfg: GraphConfig = GraphConfig()) -> nx.Mul
         base_w = time_s if cfg.use_time_weight else L
         w = base_w * (_road_penalty(r) if cfg.enable_penalty else 1.0)
 
-        # 양방향, key=link_id
         G.add_edge(u, v, key=link_id, weight=w, length_m=L, time_s=time_s, link_id=link_id)
         G.add_edge(v, u, key=link_id, weight=w, length_m=L, time_s=time_s, link_id=link_id)
     return G
 
-
 class NodeLocator:
-    """노드 좌표를 링크 시/종점에서 수집 → node_id별 평균 좌표 → KDTree"""
     def __init__(self, links: pd.DataFrame):
         pairs = []
         if {"start_x", "start_y", "end_x", "end_y"}.issubset(links.columns):
@@ -263,7 +223,6 @@ class NodeLocator:
 
 
 class EdgeLocator:
-    """링크 선분 최근접 정사영"""
     def __init__(self, links: pd.DataFrame):
         if "geom" not in links.columns or links["geom"].isna().all():
             raise RuntimeError("geometry(WKT)가 없어 edge 스냅 불가")
@@ -320,7 +279,6 @@ def _insert_virtual_node(
         w1, w2 = L1, L2
         t1, t2 = time_s * (L1 / L if L else 0), time_s * (L2 / L if L else 0)
 
-    # 원래 간선 제거(해당 key만)
     if G.has_edge(u, v, key=link_id):
         G.remove_edge(u, v, key=link_id)
     if G.has_edge(v, u, key=link_id):
@@ -411,10 +369,6 @@ class CoordinateRouter:
         L, T, W, links = _summarize(G, node_path)
         return RouteResult(node_path, links, L, T, W)
 
-
-# ------------------------------------------------------------------------------------
-# 스테이션 좌표 로드 & 경로 계산
-# ------------------------------------------------------------------------------------
 def _ensure_station_pair(db: Session, start_station_id: int, end_station_id: int) -> Tuple[Tuple[float, float], Tuple[float, float]]:
     rows = (
         db.execute(
@@ -427,7 +381,6 @@ def _ensure_station_pair(db: Session, start_station_id: int, end_station_id: int
     if start_station_id not in by_id or end_station_id not in by_id:
         raise HTTPException(status_code=400, detail="start or end station_id does not exist")
     s, e = by_id[start_station_id], by_id[end_station_id]
-    # x=lon, y=lat
     return (float(s.x), float(s.y)), (float(e.x), float(e.y))
 
 
@@ -437,23 +390,16 @@ def compute_links_via_router(
     end_station_id: int,
     ptype: PathType,
 ) -> List[int]:
-    # 1) 정류장 좌표 (WGS84)
     (o_lon, o_lat), (d_lon, d_lat) = _ensure_station_pair(db, start_station_id, end_station_id)
-
-    # 2) 로컬 BBOX로 링크 제한(성능)
     bbox = make_bbox_metric_around(o_lon, o_lat, d_lon, d_lat, buffer_m=BBOX_BUFFER_M)
-
-    # 3) 링크 로드 및 그래프 구성
     links = load_links_from_postgis(engine, table=UROAD_TABLE, schema=None, srid_metric=SRID_METRIC, bbox_metric=bbox)
 
     if links.empty:
         raise HTTPException(status_code=422, detail="no road links in bbox")
 
-    # 4) 모드별 설정
     if ptype == "shortest":
         cfg = GraphConfig(use_time_weight=False, default_speed_kmh=40.0, enable_penalty=False)
-    else:  # "optimal" 또는 existing의 fallback 계산
-        # 최적: 시간 가중 + 도로등급/차로 페널티
+    else:
         cfg = GraphConfig(use_time_weight=True, default_speed_kmh=40.0, enable_penalty=True)
 
     router_algo = CoordinateRouter(links, cfg)
@@ -472,12 +418,6 @@ def compute_links_via_router(
         raise HTTPException(status_code=422, detail="no valid link ids")
     return out
 
-
-# ------------------------------------------------------------------------------------
-# API: 경로 생성/조회 (캐시 + 계산)
-#  - existing: 있으면 그대로, 없으면 '최적' 알고리즘으로 계산 후 existing 범위에 저장
-#  - shortest/optimal: 계산 후 각 범위에 저장
-# ------------------------------------------------------------------------------------
 @router.post("/", response_model=PathOut, status_code=status.HTTP_201_CREATED)
 def create_or_get_path(payload: PathCreate, response: Response, db: Session = Depends(get_db)):
     if payload.start_station_id == payload.end_station_id:
@@ -493,15 +433,13 @@ def create_or_get_path(payload: PathCreate, response: Response, db: Session = De
             link_list=found.link_list,
         )
 
-    # 계산
     if payload.type == "existing":
-        # existing이 없으면 최적 경로로 계산하되, 저장은 existing 범위에
         link_list = compute_links_via_router(db, payload.start_station_id, payload.end_station_id, "optimal")  # fallback 계산
         target_type: PathType = "existing"
     elif payload.type == "shortest":
         link_list = compute_links_via_router(db, payload.start_station_id, payload.end_station_id, "shortest")
         target_type = "shortest"
-    else:  # "optimal"
+    else:
         link_list = compute_links_via_router(db, payload.start_station_id, payload.end_station_id, "optimal")
         target_type = "optimal"
 

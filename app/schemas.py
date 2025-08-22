@@ -1,12 +1,14 @@
 # app/schemas.py
-from typing import Optional, List, Dict, Literal
+from typing import Optional, List, Dict, Literal, Tuple
 from pydantic import BaseModel, Field, confloat, conint, ConfigDict, AliasChoices
+from datetime import time
 
-# ---------- Station ----------
+
+# 정류장
 class StationBase(BaseModel):
     station_name: str = Field(
         ...,
-        max_length=200,
+        max_length=200, 
         validation_alias=AliasChoices("station_name", "name"),
         serialization_alias="station_name",
     )
@@ -31,30 +33,25 @@ class StationOut(BaseModel):
     x: float
     y: float
 
-# ---------- Route ----------
-class StationInfo(BaseModel):
-    station_id: int
-    station_name: str
-    x: float
-    y: float
-
+# 노선
 class RouteCreate(BaseModel):
-    route_name: str = Field(..., max_length=200)
+    route_name: str = Field(
+        ...,
+        max_length=200,    
+    )
+    start_station_id: int
+    end_station_id: int
     station_list: List[int]
 
 class RouteOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     route_id: int
     route_name: str
+    start_station_id: int
+    end_station_id: int
     station_list: List[int]
 
-class RouteStationsOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-    route_id: int
-    route_name: str
-    stations: List[StationInfo]
-
-# ---------- Path ----------
+# 경로
 PathType = Literal["existing", "shortest", "optimal"]
 
 class PathCreate(BaseModel):
@@ -69,10 +66,32 @@ class PathOut(BaseModel):
     end_station_id: int
     link_list: list[int]
 
-# ---------- Scenario ----------
+# 시나리오
+class ScenarioCreate(BaseModel):
+    name: str = Field(..., max_length=200)
+    route_id: int
+    headway_min: int
+    start_time: time
+    end_time: time
+    departure_time: time
+    path_type: PathType
+
 class ScenarioOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     scenario_id: int
     name: str
-    params_json: str
-    class Config:
-        from_attributes = True
+    route_id: int
+
+    headway_min: int
+    start_time: time
+    end_time: time
+    departure_time: time
+    path_type: PathType
+
+    route_length: float
+    route_curvature: float
+
+    speed_list: List[float]
+    coord_list: List[Tuple[float, float]]
+    link_list: List[int]
