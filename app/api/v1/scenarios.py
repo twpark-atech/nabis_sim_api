@@ -28,9 +28,7 @@ TL_BASE_SEC = 105.0
 TL_JITTER_SEC = 75.0
 DEFAULT_V_MAX = 50.0  # km/h
 
-
 router = APIRouter()
-
 
 # --------------------------------
 # DB: 링크 geometry (WGS84) 가져오기
@@ -67,18 +65,14 @@ def _get_link_geometry_wgs84(db, link_id: int) -> LineString | None:
 
 # --------------------------------
 # station_list 기반 링크 시퀀스 & 정류장 정차 인덱스
+#  - 세그먼트 경계의 단일 링크 중복 제거
 # --------------------------------
 def _build_links_and_station_stop_indices(
     db: Session, station_list: List[int], path_type: str
 ) -> tuple[List[int], Dict[int, int]]:
-    """
-    returns:
-      - full_links: 전체 링크 시퀀스
-      - stop_idx_to_station_order: {세그먼트 마지막 링크 idx: (정차 순서 1..N-1)}
-    """
     full_links: List[int] = []
     stop_idx_to_station_order: Dict[int, int] = {}
-    cursor = 0
+
     for i in range(len(station_list) - 1):
         seg_links = compute_links_via_router(
             db,
@@ -86,10 +80,19 @@ def _build_links_and_station_stop_indices(
             end_station_id=station_list[i + 1],
             ptype=path_type,
         ) or []
-        if seg_links:
-            full_links.extend(seg_links)
-            stop_idx_to_station_order[cursor + len(seg_links) - 1] = i + 1
-            cursor += len(seg_links)
+        if not seg_links:
+            continue
+
+        # ✅ 경계 중복 제거: 앞 세그먼트의 마지막 링크 == 이번 세그먼트의 첫 링크면 첫 링크 제거
+        if full_links and seg_links and full_links[-1] == seg_links[0]:
+            seg_links = seg_links[1:]
+
+        full_links.extend(seg_links)
+
+        # 정류장 정차 인덱스: 붙인 뒤의 마지막 링크 인덱스에 찍기
+        if full_links:
+            stop_idx_to_station_order[len(full_links) - 1] = i + 1  # 1..N-1
+
     return full_links, stop_idx_to_station_order
 
 
@@ -102,9 +105,11 @@ def _polyline_turn_sum_radians(line: LineString) -> float:
     coords = list(line.coords)
     if len(coords) < 3:
         return 0.0
+
     def heading(p0, p1):
         dx, dy = p1[0] - p0[0], p1[1] - p0[1]
         return np.arctan2(dy, dx)
+
     total = 0.0
     prev_h = heading(coords[0], coords[1])
     for i in range(1, len(coords) - 1):
@@ -126,6 +131,156 @@ def _compute_route_curvature(db: Session, link_ids: List[int]) -> float:
     total_m = sum(float(compute_total_length([lid]) or 0.0) for lid in link_ids)
     total_km = max(1e-6, total_m / 1000.0)
     return round(turn_sum / total_km, 6)
+
+
+# --------------------------------
+# NEW ①: F_NODE/T_NODE 일괄 조회
+# --------------------------------
+def _fetch_link_nodes(db: Session, link_ids: List[int]) -> Dict[int, Tuple[int | None, int | None]]:
+    """
+    반환: {lid: (F_NODE, T_NODE)} — 누락 시 (None, None)
+    """
+    if not link_ids:
+        return {}
+    lids_text = [str(l) for l in link_ids]
+    q = text("""
+        SELECT "LINK_ID"::text AS lid_text, "F_NODE", "T_NODE"
+        FROM new_uroad
+        WHERE "LINK_ID"::text = ANY(:lid_list)
+    """)
+    rows = db.execute(q, {"lid_list": lids_text}).fetchall()
+    out: Dict[int, Tuple[int | None, int | None]] = {int(r[0]): (r[1], r[2]) for r in rows}
+    for lid in link_ids:
+        out.setdefault(int(lid), (None, None))
+    return out
+
+
+# --------------------------------
+# NEW ②: (역주행 허용) 인접 교집합 + lookahead 기반 방향 결정
+#  - (i, i+1)가 불연속이라도 (i+1, i+2)가 연결되면 i+1을 그 접속점으로 끝내고,
+#    i는 i+1의 시작점으로 끝나도록 보정
+# --------------------------------
+def _approx_dist_m(a_xy: tuple[float, float], b_xy: tuple[float, float]) -> float:
+    ax, ay = a_xy
+    bx, by = b_xy
+    dx = (ax - bx) * np.cos(np.deg2rad((ay + by) * 0.5))
+    dy = (ay - by)
+    return float(np.hypot(dx, dy) * 111_320.0)
+
+
+def _orient_links_by_intersection(db: Session, link_ids: List[int]) -> List[Tuple[int, bool]]:
+    """
+    [(lid, flipped)] 반환.
+    기본: (i, i+1) 교집합 노드 s를 기준으로 i는 s에서 끝, i+1은 s에서 시작.
+    특수: (i, i+1) 불연속이고 (i+1, i+2)에 교집합이 있으면
+          · i+1은 그 교집합(s12)에서 '끝나도록'(역주행 허용)
+          · i는 i+1의 '시작'으로 끝나도록 보정
+    """
+    n = len(link_ids)
+    if n == 0:
+        return []
+
+    nodes: Dict[int, Tuple[int | None, int | None]] = _fetch_link_nodes(db, link_ids)
+    geoms: Dict[int, LineString | None] = {lid: _get_link_geometry_wgs84(db, lid) for lid in link_ids}
+
+    def endpoints(lid: int, flip: bool) -> tuple[int | None, int | None]:
+        f, t = nodes.get(int(lid), (None, None))
+        return (t, f) if flip else (f, t)  # (start, end)
+
+    def choose_flip_for_end(lid: int, end_target: int | None) -> bool:
+        f, t = nodes.get(int(lid), (None, None))
+        if end_target is None:
+            return False
+        if t == end_target:
+            return False
+        if f == end_target:
+            return True
+        return False
+
+    def choose_flip_for_start(lid: int, start_target: int | None) -> bool:
+        f, t = nodes.get(int(lid), (None, None))
+        if start_target is None:
+            return False
+        if f == start_target:
+            return False
+        if t == start_target:
+            return True
+        return False
+
+    flips: list[bool | None] = [None] * n
+
+    i = 0
+    while i < n:
+        if i == n - 1:
+            flips[i] = False if flips[i] is None else flips[i]
+            break
+
+        lid_i, lid_j = link_ids[i], link_ids[i + 1]
+        fi, ti = nodes.get(int(lid_i), (None, None))
+        fj, tj = nodes.get(int(lid_j), (None, None))
+
+        # (i, i+1) 교집합
+        common_ij = ({fi, ti}.intersection({fj, tj}) - {None})
+        if common_ij:
+            s = next(iter(common_ij))
+            if flips[i] is None:
+                flips[i] = choose_flip_for_end(lid_i, s)
+            if flips[i + 1] is None:
+                flips[i + 1] = choose_flip_for_start(lid_j, s)
+            i += 1
+            continue
+
+        # lookahead: (i+1, i+2) 교집합으로 i+1 끝점을 맞추고 i를 그 시작점에 맞춤
+        if i + 2 < n:
+            lid_k = link_ids[i + 2]
+            fk, tk = nodes.get(int(lid_k), (None, None))
+            common_jk = ({fj, tj}.intersection({fk, tk}) - {None})
+            if common_jk:
+                s12 = next(iter(common_jk))
+                flips[i + 1] = choose_flip_for_end(lid_j, s12)
+
+                # i는 i+1의 시작으로 끝나게
+                gj = geoms.get(lid_j)
+                if flips[i + 1]:
+                    start_j = tj  # flipped: start is original T
+                else:
+                    start_j = fj
+
+                if flips[i] is None:
+                    if start_j in {fi, ti}:
+                        flips[i] = choose_flip_for_end(lid_i, start_j)
+                    else:
+                        gi = geoms.get(lid_i)
+                        if gi is not None and gj is not None and len(gi.coords) >= 2 and len(gj.coords) >= 2:
+                            start_j_xy = (gj.coords[0][0], gj.coords[0][1]) if not flips[i + 1] else (gj.coords[-1][0], gj.coords[-1][1])
+                            end_i_xy_false = (gi.coords[-1][0], gi.coords[-1][1])
+                            end_i_xy_true = (gi.coords[0][0], gi.coords[0][1])
+                            flips[i] = (_approx_dist_m(end_i_xy_true, start_j_xy) <
+                                        _approx_dist_m(end_i_xy_false, start_j_xy))
+                        else:
+                            flips[i] = False
+                i += 1
+                continue
+
+        # 여전히 정보 부족 → 지오메트리 근접도로 i만 결정
+        if flips[i] is None:
+            gi = geoms.get(lid_i)
+            gj = geoms.get(lid_j)
+            if gi is not None and gj is not None and len(gi.coords) >= 2 and len(gj.coords) >= 2:
+                start_j_xy = (gj.coords[0][0], gj.coords[0][1])
+                end_i_xy_false = (gi.coords[-1][0], gi.coords[-1][1])
+                end_i_xy_true = (gi.coords[0][0], gi.coords[0][1])
+                flips[i] = (_approx_dist_m(end_i_xy_true, start_j_xy) <
+                            _approx_dist_m(end_i_xy_false, start_j_xy))
+            else:
+                flips[i] = False
+
+        if flips[i + 1] is None:
+            flips[i + 1] = False
+        i += 1
+
+    flips = [bool(f) if f is not None else False for f in flips]
+    return list(zip(link_ids, flips))
 
 
 # --------------------------------
@@ -186,7 +341,8 @@ def _simulate_segment_speeds(
 
 
 # --------------------------------
-# 속도/좌표 생성 엔진 (compute_speed_profile 대체)
+# 속도/좌표 생성 엔진
+#  - 링크 방향 보정(역주행 허용) + 불연속 direct 연결
 # --------------------------------
 def _make_speed_and_coords(
     db: Session,
@@ -203,6 +359,8 @@ def _make_speed_and_coords(
     링크별 주행을 순회하며 속도/좌표 시퀀스를 만든다.
     - 정류장: stop_idx_to_station_order 에 명시된 링크 끝에서 정차
     - 신호등: 확률적으로 정차(105±75초)
+    - 방향: 인접 교집합 + lookahead 기반으로 보정(역주행 허용)
+    - 불연속 접속: 이전 끝점과 다음 시작점이 멀면 'direct'로 1틱(0 m/s) 이어붙임
     """
     rng = np.random.default_rng(seed)
     speed_list: List[float] = []
@@ -216,15 +374,34 @@ def _make_speed_and_coords(
         station_dwell_sec = list(station_dwell_sec) + [station_dwell_sec[-1]] * (num_stops - len(station_dwell_sec))
 
     cur_v = 0.0
-    geom_cache: Dict[int, LineString | None] = {}
     len_cache: Dict[int, float] = {}
 
-    for idx, lid in enumerate(link_ids):
+    # 방향 정합 계산
+    oriented = _orient_links_by_intersection(db, link_ids)  # [(lid, flipped)]
+    geom_cache: Dict[int, LineString | None] = {}
+
+    for idx, (lid, flip) in enumerate(oriented):
         if lid not in len_cache:
             len_cache[lid] = float(compute_total_length([lid]) or 0.0)
         link_len = len_cache[lid]
         if link_len <= 0:
             continue
+
+        # geometry (필요 시 뒤집기)
+        if lid not in geom_cache:
+            base = _get_link_geometry_wgs84(db, lid)
+            if base is not None and flip:
+                base = LineString(list(base.coords)[::-1])
+            geom_cache[lid] = base
+        line = geom_cache[lid]
+
+        # ✅ 불연속 direct 연결: 이전 끝점과 이번 시작점이 멀면 1틱(속도 0)으로 잇기
+        if coord_list and line is not None and len(line.coords) >= 2:
+            start_xy = (line.coords[0][0], line.coords[0][1])
+            if _approx_dist_m(coord_list[-1], start_xy) > 5.0:  # 5m 초과면 direct 패치
+                speed_list.append(0.0)
+                coord_list.append(start_xy)
+                cur_v = 0.0
 
         # 정류장 / 신호등 정차 판단
         station_stop_sec = 0.0
@@ -251,10 +428,6 @@ def _make_speed_and_coords(
         speed_list.extend(seg_speeds)
 
         # 좌표 보간
-        if lid not in geom_cache:
-            geom_cache[lid] = _get_link_geometry_wgs84(db, lid)
-        line = geom_cache[lid]
-
         cum_m = _cum_dists_from_speeds_kmh(seg_speeds, dt=DT)
         ratios = (cum_m / max(1e-6, link_len)).clip(0.0, 1.0)
         if line is not None:
@@ -307,7 +480,7 @@ def create_scenario(payload: ScenarioCreate, db: Session = Depends(get_db)):
     if len(station_list) < 2:
         raise HTTPException(status_code=400, detail="해당 노선의 station_list가 비어있습니다.")
 
-    # 4) 전체 링크 & 정류장 정차 인덱스
+    # 4) 전체 링크 & 정류장 정차 인덱스 (경계 중복 제거 포함)
     link_list, stop_idx_to_station_order = _build_links_and_station_stop_indices(
         db, station_list, payload.path_type
     )
@@ -318,8 +491,7 @@ def create_scenario(payload: ScenarioCreate, db: Session = Depends(get_db)):
     route_length_m = float(sum(float(compute_total_length([lid]) or 0.0) for lid in link_list))
     route_curvature = _compute_route_curvature(db, link_list)
 
-    # 6) 속도/좌표 시퀀스 생성 (compute_speed_profile 대체)
-    #    - 출발/배차/운행시간을 고급 로직에 반영하려면 내부에 캘린더/수요 예측 등을 확장
+    # 6) 속도/좌표 시퀀스 생성 (방향 보정/불연속 direct 포함)
     speed_list, coord_list = _make_speed_and_coords(
         db=db,
         link_ids=link_list,
