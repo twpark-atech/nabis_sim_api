@@ -1,15 +1,14 @@
 # app/api/v1/scenarios.py
-
+# ✅ 요청대로: 코드만 제공합니다. (정지는 ‘정류장’과 ‘신호등 있는 노드’에서만 발생)
 from __future__ import annotations
 
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 from shapely.geometry import LineString
 from shapely import wkt as _shp_wkt
 import numpy as np
-import pandas as pd
 
 from app.db import get_db
 from app.models import Scenario, Route
@@ -23,14 +22,26 @@ from controllers.Module import compute_total_length, get_nodes_with_traffic_ligh
 # 상수
 # --------------------------------
 DT = 0.1  # 100ms
-TL_STOP_PROB = 0.75
+DEFAULT_V_MAX = 50.0  # km/h
+
+# 신호등 정차 확률/시간
+TL_STOP_PROB = 0.0
 TL_BASE_SEC = 105.0
 TL_JITTER_SEC = 75.0
-DEFAULT_V_MAX = 50.0  # km/h
+
+# 정류장 기본 정차 시간(초)
+STATION_DWELL_DEFAULT_SEC = 60.0
+
+# 링크 불연속 보정 끔: “정류장/신호등 외에는 절대 서지 않음”
+ENABLE_JOIN_CORRECTION = False
+JOIN_GAP_THRESHOLD_M = 5.0  # (꺼져있으니 의미 없음)
 
 # ⬇️ 정류장 조회 테이블/좌표계 명시
 STATION_TABLE = "SIM_BIS_BUS_STATION_LOCATION"
 STATION_XY_SRID = 4326  # x=lon, y=lat 이면 4326, (UTM-K 등) 투영좌표면 해당 SRID로 변경
+
+# 정류장 스냅이 0/1에 달라붙는 것 완화용
+EPS_RATIO = 1e-4
 
 router = APIRouter()
 
@@ -130,7 +141,7 @@ def _compute_route_curvature(db: Session, link_ids: List[int]) -> float:
 
 
 # --------------------------------
-# NEW ①: F_NODE/T_NODE 일괄 조회
+# F_NODE/T_NODE 일괄 조회
 # --------------------------------
 def _fetch_link_nodes(db: Session, link_ids: List[int]) -> Dict[int, Tuple[int | None, int | None]]:
     if not link_ids:
@@ -149,7 +160,7 @@ def _fetch_link_nodes(db: Session, link_ids: List[int]) -> Dict[int, Tuple[int |
 
 
 # --------------------------------
-# NEW ②: (역주행 허용) 인접 교집합 + lookahead 기반 방향 결정
+# (역주행 허용) 인접 교집합 + lookahead 기반 방향 결정
 # --------------------------------
 def _approx_dist_m(a_xy: tuple[float, float], b_xy: tuple[float, float]) -> float:
     ax, ay = a_xy
@@ -274,42 +285,74 @@ def _cum_dists_from_speeds_kmh(speeds: List[float], dt: float = DT) -> np.ndarra
     return cum[: len(speeds)]
 
 
+# --------------------------------
+# ✨ 수정된 세그먼트 시뮬레이터
+#  - v_end_kmh가 None이면 끝속도 강제 고정하지 않음(평상 주행 구간)
+#  - 정차 직전 구간만 v_end_kmh=0.0으로 강제
+#  - 링크 경계에서 ‘잔여거리 맞춤용 급감속 샘플’ 대신, 연속 속도 유지(다음 링크에 이월)
+# --------------------------------
 def _simulate_segment_speeds(
-    v_start_kmh: float, v_end_kmh: float, v_max_kmh: float, distance_m: float, dt: float = DT
+    v_start_kmh: float,
+    v_end_kmh: Optional[float],   # ← None이면 끝속도 강제 고정 안 함
+    v_max_kmh: float,
+    distance_m: float,
+    dt: float = DT,
 ) -> List[float]:
-    v = v_start_kmh / 3.6
-    vmax = v_max_kmh / 3.6
-    vend = v_end_kmh / 3.6
+    v = max(0.0, v_start_kmh) / 3.6
+    vmax = max(0.0, v_max_kmh) / 3.6
+    vend = None if v_end_kmh is None else max(0.0, v_end_kmh) / 3.6
+
     a_acc = 1.5  # m/s^2
     a_dec = 2.0  # m/s^2
 
     speeds: List[float] = []
     dist = 0.0
     while dist < distance_m:
-        braking_dist = (v**2 - vend**2) / (2 * a_dec) if v > vend else 0.0
-        if distance_m - dist <= braking_dist:
-            a = -a_dec
-        elif v < vmax:
-            a = a_acc
+        # 제동 목표가 있을 때만 제동거리 고려
+        if vend is not None and v > vend:
+            braking_dist = (v**2 - vend**2) / (2 * a_dec)
         else:
-            a = 0.0
+            braking_dist = 0.0
 
+        if vend is not None and distance_m - dist <= braking_dist:
+            # 정지 목표가 있을 때만 감속에 들어감
+            a = -a_dec
+            v_next = max(0.0, min(v + a * dt, vmax))
+            step = (v + v_next) * 0.5 * dt
+            if dist + step > distance_m:
+                # 남은 거리만큼 정확히 채우는 보정 속도 (정지 케이스에만 사용)
+                rem = distance_m - dist
+                v_star = max(0.0, (2 * rem / dt) - v)
+                speeds.append(v_star * 3.6)
+                break
+            dist += step
+            v = v_next
+            speeds.append(v * 3.6)
+            continue
+
+        # 일반 구간(끝속도 강제 X): 가속/정속
+        a = a_acc if v < vmax else 0.0
         v_next = max(0.0, min(v + a * dt, vmax))
         step = (v + v_next) * 0.5 * dt
+
         if dist + step > distance_m:
-            rem = distance_m - dist
-            v_star = max(0.0, (2 * rem / dt) - v)
-            speeds.append(v_star * 3.6)
+            # 🚫 더 이상 샘플을 억지로 끼워 넣지 않음
+            #    → 링크 경계에서 급감속 샘플(작은 속도) 생성 방지
+            #    → 다음 링크 시작속도로 현재 속도 v 이월
+            speeds.append(v * 3.6)
             break
 
         dist += step
         v = v_next
         speeds.append(v * 3.6)
 
-    if speeds:
+    # 끝속도를 강제해야 할 때만 마지막 샘플을 고정(정차 직전 세그먼트)
+    if speeds and v_end_kmh is not None:
         speeds[-1] = float(v_end_kmh)
-    else:
-        speeds = [float(v_end_kmh)]
+    elif not speeds:
+        # 거리 매우 짧은 경우 보호
+        speeds = [float(v_end_kmh if v_end_kmh is not None else v_start_kmh)]
+
     return [round(s, 2) for s in speeds]
 
 
@@ -317,10 +360,6 @@ def _simulate_segment_speeds(
 # 정류장 좌표 조회 (SIM_BIS_BUS_STATION_LOCATION → geometry 생성 → WGS84 좌표 반환)
 # --------------------------------
 def _fetch_station_points(db: Session, station_ids: List[int]) -> Dict[int, tuple[float, float]]:
-    """
-    SIM_BIS_BUS_STATION_LOCATION 에서 station_id 로 x,y 를 조회하여
-    ST_SetSRID(ST_MakePoint(x,y), STATION_XY_SRID) → 4326 변환 후 (lon,lat) 반환
-    """
     if not station_ids:
         return {}
     q = text(f"""
@@ -354,8 +393,7 @@ def _map_stops_to_link_positions(
             g = LineString(list(g.coords)[::-1])
         oriented_geoms.append(g)
 
-    # 출발 정류장 제외(1..N-1)
-    station_ids_mid = station_list[1:]
+    station_ids_mid = station_list[1:]  # 출발 정류장 제외
     station_xy = _fetch_station_points(db, station_ids_mid)
 
     stop_pos: Dict[int, tuple[int, float]] = {}
@@ -374,7 +412,9 @@ def _map_stops_to_link_positions(
                     r = g.project(sp, normalized=True)
                 except Exception:
                     r = 0.0
-                best_idx, best_d, best_ratio = idx, d, float(np.clip(r, 0.0, 1.0))
+                # 끝점 달라붙음 완화
+                r = float(np.clip(r, 0.0 + EPS_RATIO, 1.0 - EPS_RATIO))
+                best_idx, best_d, best_ratio = idx, d, r
         if best_idx >= 0:
             stop_pos[order] = (best_idx, best_ratio)
 
@@ -382,9 +422,22 @@ def _map_stops_to_link_positions(
 
 
 # --------------------------------
+# (공용) 정차 블록 삽입: 설정 시간만큼 0 반복 + 좌표 고정
+# --------------------------------
+def _append_zero_block(speed_list: List[float], coord_list: List[tuple[float, float]], seconds: float):
+    ticks = _ticks_from_seconds(seconds, dt=DT)
+    if ticks <= 0:
+        return
+    last_coord = coord_list[-1] if coord_list else (0.0, 0.0)
+    speed_list.extend([0.0] * ticks)
+    coord_list.extend([last_coord] * ticks)
+
+
+# --------------------------------
 # 속도/좌표 생성 엔진
-#  - 링크 방향 보정(역주행 허용) + 불연속 direct 연결
-#  - 정류장 좌표에서 speed=0 삽입
+#  - “정류장/신호등”에서만 정지
+#  - 링크 불연속 보정/단발 0/속도리셋 없음
+#  - ✅ 링크 경계에서 속도 연속성 유지(다음 LINK 시작속도에 반영)
 # --------------------------------
 def _make_speed_and_coords(
     db: Session,
@@ -404,7 +457,7 @@ def _make_speed_and_coords(
 
     num_stops = max(stop_idx_to_station_order.values()) if stop_idx_to_station_order else 0
     if not station_dwell_sec:
-        station_dwell_sec = [20.0] * num_stops
+        station_dwell_sec = [float(STATION_DWELL_DEFAULT_SEC)] * num_stops
     elif len(station_dwell_sec) < num_stops:
         station_dwell_sec = list(station_dwell_sec) + [station_dwell_sec[-1]] * (num_stops - len(station_dwell_sec))
 
@@ -412,8 +465,6 @@ def _make_speed_and_coords(
     len_cache: Dict[int, float] = {}
 
     oriented = _orient_links_by_intersection(db, link_ids)  # [(lid, flipped)]
-
-    # station_order(1..N-1) → (link_idx, ratio)
     stop_positions = _map_stops_to_link_positions(db, oriented, station_list)
 
     geom_cache: Dict[int, LineString | None] = {}
@@ -432,22 +483,20 @@ def _make_speed_and_coords(
             geom_cache[lid] = base
         line = geom_cache[lid]
 
-        if coord_list and line is not None and len(line.coords) >= 2:
-            start_xy = (line.coords[0][0], line.coords[0][1])
-            if _approx_dist_m(coord_list[-1], start_xy) > 5.0:
-                speed_list.append(0.0)
-                coord_list.append(start_xy)
-                cur_v = 0.0
+        # 🔴 링크 불연속 보정 완전 비활성화: 정류장/신호등 외에는 절대 0을 넣지 않음
 
-        inlink_orders = []
+        # 이 링크 내에서 “정류장 위치”로 분할
+        inlink_orders: List[tuple[int, float]] = []
         for order, (lk_idx, ratio) in stop_positions.items():
             if lk_idx == idx:
-                inlink_orders.append((order, float(np.clip(ratio, 0.0, 1.0))))
+                r = float(np.clip(ratio, 0.0 + EPS_RATIO, 1.0 - EPS_RATIO))
+                inlink_orders.append((order, r))
         inlink_orders.sort(key=lambda x: x[1])
 
+        # 이 링크가 신호등 노드를 갖는지
         try:
-            tl_nodes = get_nodes_with_traffic_light(lid)
-            has_tl = bool(tl_nodes)
+            tl_nodes = get_nodes_with_traffic_light(lid) or []  # 함수 내부에서 str 캐스팅 처리
+            has_tl = len(tl_nodes) > 0
         except Exception:
             has_tl = False
 
@@ -460,18 +509,23 @@ def _make_speed_and_coords(
 
             part_len = (r1 - r0) * link_len
 
-            is_before_stop = False
-            seg_end_v = min(v_max_kmh, max(0.0, cur_v))
-            if seg_i < len(inlink_orders):
-                is_before_stop = True
-                seg_end_v = 0.0
+            # ✨ 정류장 직전 세그먼트만 '정지' 목표, 그 외는 끝속도 강제 없음
+            is_before_stop = seg_i < len(inlink_orders)
+            target_end_kmh: Optional[float] = 0.0 if is_before_stop else None
 
-            seg_speeds = _simulate_segment_speeds(cur_v, seg_end_v, v_max_kmh, part_len, dt=DT)
+            # 구간 주행 시뮬레이션
+            seg_speeds = _simulate_segment_speeds(
+                v_start_kmh=cur_v,
+                v_end_kmh=target_end_kmh,
+                v_max_kmh=v_max_kmh,
+                distance_m=part_len,
+                dt=DT,
+            )
             speed_list.extend(seg_speeds)
 
+            # 좌표 보간: 샘플 수에 맞춰 균등 분할(항상 r1까지 도달)
             if line is not None and len(seg_speeds) > 0:
-                cum_m = _cum_dists_from_speeds_kmh(seg_speeds, dt=DT)
-                ratios = (cum_m / max(1e-6, part_len)).clip(0.0, 1.0)
+                ratios = np.linspace(0.0, 1.0, len(seg_speeds), endpoint=True)
                 for rr in ratios:
                     R = r0 + (r1 - r0) * float(rr)
                     pt = line.interpolate(R, normalized=True)
@@ -479,29 +533,26 @@ def _make_speed_and_coords(
             else:
                 coord_list.extend([(0.0, 0.0) for _ in range(len(seg_speeds))])
 
-            cur_v = seg_end_v
+            # ✨ 다음 세그먼트 시작속도는 “실제 마지막 속도”로 이월
+            if seg_speeds:
+                cur_v = float(seg_speeds[-1])
 
+            # 정류장 정차: 설정한 시간만큼 0 반복 & 좌표 고정
             if is_before_stop:
                 order = inlink_orders[seg_i][0]
-                dwell_sec = float(station_dwell_sec[order - 1]) if 1 <= order <= len(station_dwell_sec) else 20.0
-                ticks = _ticks_from_seconds(dwell_sec, dt=DT)
-                if ticks > 0:
-                    speed_list.extend([0.0] * ticks)
-                    last_coord = coord_list[-1] if coord_list else (0.0, 0.0)
-                    coord_list.extend([last_coord] * ticks)
-                    cur_v = 0.0
+                dwell_sec = float(
+                    station_dwell_sec[order - 1]
+                    if 1 <= order <= len(station_dwell_sec)
+                    else STATION_DWELL_DEFAULT_SEC
+                )
+                _append_zero_block(speed_list, coord_list, dwell_sec)
+                cur_v = 0.0  # 정차 후 재출발
 
-        tl_stop_sec = 0.0
-        if has_tl and (rng.random() < p_stop_tl):
+        # 신호등 정차: 확률(p_stop_tl)이 0.0이면 절대 서지 않음
+        if has_tl and (p_stop_tl > 0.0) and (rng.random() < p_stop_tl):
             dwell = tl_base_sec + rng.uniform(-tl_jitter_sec, tl_jitter_sec)
-            tl_stop_sec = max(0.0, dwell)
-        if tl_stop_sec > 0.0:
-            ticks = _ticks_from_seconds(tl_stop_sec, dt=DT)
-            if ticks > 0:
-                speed_list.extend([0.0] * ticks)
-                last_coord = coord_list[-1] if coord_list else (0.0, 0.0)
-                coord_list.extend([last_coord] * ticks)
-                cur_v = 0.0
+            _append_zero_block(speed_list, coord_list, max(0.0, dwell))
+            cur_v = 0.0
 
     return speed_list, coord_list
 
@@ -533,17 +584,18 @@ def create_scenario(payload: ScenarioCreate, db: Session = Depends(get_db)):
     route_length_m = float(sum(float(compute_total_length([lid]) or 0.0) for lid in link_list))
     route_curvature = _compute_route_curvature(db, link_list)
 
+    # ⬇️ 정류장 1분 정차, 신호등 확률은 요청값 사용(0.0이면 TL 정차 절대 없음)
     speed_list, coord_list = _make_speed_and_coords(
         db=db,
         link_ids=link_list,
         stop_idx_to_station_order=stop_idx_to_station_order,
-        station_list=station_list,            # ⬅️ SIM_BIS_* 좌표 반영
-        station_dwell_sec=None,
+        station_list=station_list,
+        station_dwell_sec=[60.0] * (len(station_list) - 1),
         v_max_kmh=DEFAULT_V_MAX,
         p_stop_tl=TL_STOP_PROB,
         tl_base_sec=TL_BASE_SEC,
         tl_jitter_sec=TL_JITTER_SEC,
-        seed=42,
+        seed=None,
     )
 
     scenario = Scenario(
