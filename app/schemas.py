@@ -95,3 +95,4 @@ class ScenarioOut(BaseModel):
     speed_list: List[float]
     coord_list: List[Tuple[float, float]]
     link_list: List[int]
+    status: str

@@ -7,7 +7,9 @@ daeduk_api
 │  └─ api
 ├─controllers
 ├─bus_oppor_induce_prediction # 추가 예정
-└─traffic_congest_prediction # 추가 예정
+├─traffic_congest_prediction # 추가 예정
+├─docker-compose.yml
+└─Dockerfile
 ```
 ### 구축 환경
 |                | version |
@@ -20,23 +22,12 @@ daeduk_api
 | GPU | RTX 3090 |
 
 ### 실행 방법
-1. 가상 환경 생성
+1. Docker Build & 실행
 ```
-conda create -n nabis_sim python==3.10
-conda activate nabis_sim
-```
-
-2. 필수 패키지 설치
-```
-pip install -r requirements.txt
+docker compose up -d build
 ```
 
-3. uvicorn 실행
-```
-python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-4. API 사용
+2. API 사용
 - /api/v1/stations/
     - Input: {"station_name": "string", "x": float, "y": float}
     - Output: {"station_id": int, "station_name": "string", "x": float, "y": float}

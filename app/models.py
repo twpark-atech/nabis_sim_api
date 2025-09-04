@@ -41,22 +41,26 @@ PATH_TYPE_ENUM = PG_ENUM("existing", "shortest", "optimal", name="path_type_enum
 class Scenario(Base):
     __tablename__ = "SIM_SCENARIOS"
 
+    # 시나리오 ID는 클라이언트에서 제공(autoincrement 아님)
     scenario_id: Mapped[int]        = mapped_column(BigInteger, primary_key=True)
-    name: Mapped[str]               = mapped_column(String(200), nullable=False)    
+    name: Mapped[str]               = mapped_column(String(200), nullable=False)
 
-    route_id: Mapped[int]           = mapped_column(BigInteger, nullable=False)    
-    headway_min: Mapped[int]        = mapped_column(Integer, nullable=False)    
-    start_time: Mapped[time]        = mapped_column(Time(timezone=False), nullable=False)    
-    end_time: Mapped[time]          = mapped_column(Time(timezone=False), nullable=False)    
+    route_id: Mapped[int]           = mapped_column(BigInteger, nullable=False)
+    headway_min: Mapped[int]        = mapped_column(Integer, nullable=False)
+    start_time: Mapped[time]        = mapped_column(Time(timezone=False), nullable=False)
+    end_time: Mapped[time]          = mapped_column(Time(timezone=False), nullable=False)
     departure_time: Mapped[time]    = mapped_column(Time(timezone=False), nullable=False)
     path_type: Mapped[str]          = mapped_column(PATH_TYPE_ENUM, nullable=False)
-    
-    link_list: Mapped[list[int]]    = mapped_column(ARRAY(BigInteger), nullable=False)
-    route_length: Mapped[float]     = mapped_column(Float, nullable=False)
-    route_curvature: Mapped[float]  = mapped_column(Float, nullable=False)
-    
-    speed_list: Mapped[list[float]] = mapped_column(ARRAY(Float), nullable=False)
-    coord_list: Mapped[list]        = mapped_column(JSONB, nullable=False)
+
+    # 🔽 Celery가 채우기 전까지는 비워둘 수 있게 모두 NULL 허용
+    link_list: Mapped[list[int] | None]    = mapped_column(ARRAY(BigInteger), nullable=True)
+    route_length: Mapped[float | None]     = mapped_column(Float, nullable=True)
+    route_curvature: Mapped[float | None]  = mapped_column(Float, nullable=True)
+    speed_list: Mapped[list[float] | None] = mapped_column(ARRAY(Float), nullable=True)
+    coord_list: Mapped[list | None]        = mapped_column(JSONB, nullable=True)
+
+    # ✨ 상태 컬럼: "생성 중" → "생성 완료"/"생성 실패"
+    status: Mapped[str]             = mapped_column(String(16), nullable=False, default="생성 중", server_default="생성 중")
 
     __table_args__ = (
         Index("ix_sim_scenarios_route_id", "route_id"),

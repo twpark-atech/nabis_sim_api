@@ -1,5 +1,4 @@
 # app/api/v1/scenarios.py
-# ✅ 코드만 제공합니다. (링크별 vmax=교통테이블 actual_speed, 2025-08-01의 같은 ‘시’ 기준)
 from __future__ import annotations
 
 from typing import List, Tuple, Dict, Optional
