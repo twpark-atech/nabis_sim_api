@@ -1,6 +1,8 @@
 fastapi
-uvicorn
-sqlalchemy
+uvicorn[standard]
+celery[redis]
+redis
+SQLAlchemy
 psycopg2-binary
 pandas
 numpy
@@ -11,3 +13,4 @@ geopandas
 matplotlib
 openpyxl
 xlsxwriter
+networkx

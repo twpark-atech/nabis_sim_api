@@ -110,7 +110,7 @@ def get_nodes_with_traffic_light(link_id: int):
     """)
     coords = []
     with engine.connect() as conn:
-        row = conn.execute(query_nodes, {"link_id": link_id}).mappings().fetchone()
+        row = conn.execute(query_nodes, {"link_id": str(link_id)}).mappings().fetchone()
         if not row:
             return coords
         for node_id in [row["F_NODE"], row["T_NODE"]]:

@@ -1,8 +1,10 @@
 # app/api/v1/scenarios.py
-# ✅ 코드만 제공합니다. (정지는 ‘정류장’과 ‘신호등 있는 노드’에서만 발생, 비정지 구간 시작속도 0 리셋 방지)
+# ✅ 코드만 제공합니다. (링크별 vmax=교통테이블 actual_speed, 2025-08-01의 같은 ‘시’ 기준)
 from __future__ import annotations
 
 from typing import List, Tuple, Dict, Optional
+from datetime import datetime, timedelta, time as _time, date as _date
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -42,6 +44,9 @@ STATION_XY_SRID = 4326  # x=lon, y=lat 이면 4326, (UTM-K 등) 투영좌표면 
 
 # 정류장 스냅이 0/1에 달라붙는 것 완화용
 EPS_RATIO = 1e-4
+
+# 교통 기준일(링크별 vmax를 가져올 날짜). 시간대는 payload.departure_time의 '시' 사용
+TRAFFIC_REF_DATE = _date(2025, 8, 1)
 
 router = APIRouter()
 
@@ -286,10 +291,7 @@ def _cum_dists_from_speeds_kmh(speeds: List[float], dt: float = DT) -> np.ndarra
 
 
 # --------------------------------
-# ✨ 세그먼트 시뮬레이터
-#  - v_end_kmh=None: 비정지 구간(끝속도 강제 X) → 경계에서 속도 유지(연속성 보장)
-#  - v_end_kmh=0: 정지 목표(정류장/신호등 직전 감속)
-#  - ⛳︎ 수정: 비정지 구간에서 '잔여거리 맞춤 보정'으로 0이 찍히던 문제 제거
+# ✨ 세그먼트 시뮬레이터 (감속/정지/연속성 보장)
 # --------------------------------
 def _simulate_segment_speeds(
     v_start_kmh: float,
@@ -316,30 +318,24 @@ def _simulate_segment_speeds(
             braking_dist = 0.0
 
         if vend is not None and v > vend and distance_m - dist <= braking_dist + 1e-9:
-            # 감속 단계: 매 tick마다 a_dec로 줄이되 vend 아래로는 안내림
             a = -a_dec
             v_next = max(v + a * dt, vend)
         elif v < vmax:
-            # 가속 또는 정속
             a = a_acc
             v_next = min(v + a * dt, vmax)
         else:
             a = 0.0
             v_next = v
 
-        # 이번 tick의 이동거리(사다리꼴 적분)
         step = (v + v_next) * 0.5 * dt
 
         if dist + step > distance_m:
-            # ⛳︎ 경계 처리
             if vend is None:
-                # 비정지 구간: 속도 연속성 보존 → 현재 속도 그대로 종료(다음 세그먼트/링크로 이월)
                 speeds.append(round(v * 3.6, 2))
             else:
-                # 정지 목표 구간: 남은 거리(rem)에 맞춰 마지막 속도 보정(단, vend 이하로 내리지 않음)
                 rem = max(0.0, distance_m - dist)
-                v_req = max(vend, (2.0 * rem / dt) - v)  # vend ≤ v_req ≤ v
-                v_req = min(v_req, v)  # 과도한 증가 방지
+                v_req = max(vend, (2.0 * rem / dt) - v)
+                v_req = min(v_req, v)
                 speeds.append(round(v_req * 3.6, 2))
             break
 
@@ -347,11 +343,9 @@ def _simulate_segment_speeds(
         v = v_next
         speeds.append(round(v * 3.6, 2))
 
-        # 정지 목표에 도달했고 거리도 소진되면 종료
         if vend is not None and abs(v - vend) < 1e-9 and dist >= distance_m - 1e-9:
             break
 
-    # 거리 매우 짧아 while에 한 번도 못 들어간 경우 보호
     if not speeds:
         last = v_end_kmh if v_end_kmh is not None else v_start_kmh
         speeds = [float(last)]
@@ -436,10 +430,47 @@ def _append_zero_block(speed_list: List[float], coord_list: List[tuple[float, fl
 
 
 # --------------------------------
-# 속도/좌표 생성 엔진
-#  - “정류장/신호등”에서만 정지
-#  - 링크 경계에서 속도 연속성 유지(비정지 구간 start=이전 end)
-#  - 신호등에서는 링크 마지막 세그먼트를 ‘정지 목표’로 처리 후 대기
+# NEW: uroad_traffic_filled에서 링크별 vmax(=actual_speed) 가져오기
+#  - 기준일: TRAFFIC_REF_DATE(2025-08-01)
+#  - 시간대: ref_hour(정수 시). createddate ∈ [ref_hour, ref_hour+1)
+# --------------------------------
+def _fetch_per_link_vmax_from_traffic(
+    db: Session,
+    link_ids: List[int],
+    ref_hour: int,
+) -> Dict[int, float]:
+    if not link_ids:
+        return {}
+    start_dt = datetime.combine(TRAFFIC_REF_DATE, _time(ref_hour, 0, 0))
+    end_dt = start_dt + timedelta(hours=1)
+
+    lids_text = [str(l) for l in link_ids]
+    q = text("""
+        SELECT linkid::text AS lid_text, AVG(actual_speed)::float AS vmax_kmh
+        FROM uroad_traffic_filled
+        WHERE createddate >= :start_dt
+          AND createddate <  :end_dt
+          AND linkid::text = ANY(:lid_list)
+        GROUP BY linkid::text
+    """)
+    rows = db.execute(q, {"start_dt": start_dt, "end_dt": end_dt, "lid_list": lids_text}).fetchall()
+
+    out: Dict[int, float] = {}
+    for lid_text, vmax_kmh in rows:
+        try:
+            lid_int = int(lid_text)
+        except Exception:
+            continue
+        if vmax_kmh is not None and vmax_kmh > 0:
+            out[lid_int] = float(vmax_kmh)
+    return out
+
+
+# --------------------------------
+# 속도/좌표 생성 엔진 (링크별 vmax 적용)
+#  - 비정지 구간 시작속도 0 리셋 방지
+#  - 신호등은 링크 마지막 세그먼트를 ‘정지 목표’로 처리 후 대기
+#  - 각 링크 vmax = 교통 테이블 actual_speed(없으면 DEFAULT_V_MAX)
 # --------------------------------
 def _make_speed_and_coords(
     db: Session,
@@ -452,6 +483,7 @@ def _make_speed_and_coords(
     tl_base_sec: float = TL_BASE_SEC,
     tl_jitter_sec: float = TL_JITTER_SEC,
     seed: int | None = None,
+    per_link_vmax: Optional[Dict[int, float]] = None,
 ) -> tuple[List[float], List[tuple[float, float]]]:
     rng = np.random.default_rng(seed)
     speed_list: List[float] = []
@@ -485,7 +517,10 @@ def _make_speed_and_coords(
             geom_cache[lid] = base
         line = geom_cache[lid]
 
-        # 이 링크가 신호등 노드를 갖는지 + 이번 링크 끝에서 멈출지(확률) 선결정
+        # 이 링크의 vmax 결정 (교통값 우선, 없으면 기본값)
+        link_vmax = float(max(0.1, per_link_vmax.get(lid, v_max_kmh))) if per_link_vmax else float(v_max_kmh)
+
+        # 신호등 멈춤 여부 선결정
         try:
             tl_nodes = get_nodes_with_traffic_light(lid) or []
             has_tl = len(tl_nodes) > 0
@@ -502,7 +537,6 @@ def _make_speed_and_coords(
         inlink_orders.sort(key=lambda x: x[1])
 
         cut_points = [0.0] + [r for _, r in inlink_orders] + [1.0]
-
         did_station_stop_on_link = False
 
         for seg_i in range(len(cut_points) - 1):
@@ -519,17 +553,17 @@ def _make_speed_and_coords(
 
             target_end_kmh: Optional[float] = 0.0 if is_before_stop else None
 
-            # 구간 주행 시뮬레이션
+            # 구간 주행 시뮬레이션 (링크별 vmax 적용)
             seg_speeds = _simulate_segment_speeds(
                 v_start_kmh=cur_v,
                 v_end_kmh=target_end_kmh,
-                v_max_kmh=v_max_kmh,
+                v_max_kmh=link_vmax,
                 distance_m=part_len,
                 dt=DT,
             )
             speed_list.extend(seg_speeds)
 
-            # 좌표 보간: 샘플 수에 맞춰 균등 분할(단, 1샘플이면 r1에 찍어서 진행 보장)
+            # 좌표 보간
             if line is not None and len(seg_speeds) > 0:
                 if len(seg_speeds) == 1:
                     ratios = np.array([1.0], dtype=float)
@@ -542,11 +576,9 @@ def _make_speed_and_coords(
             else:
                 coord_list.extend([(0.0, 0.0) for _ in range(len(seg_speeds))])
 
-            # 다음 세그먼트 시작속도는 실제 마지막 속도로 이월
             if seg_speeds:
                 cur_v = float(seg_speeds[-1])
 
-            # 정류장 정차 처리(정차 시간 0 블록 + cur_v=0)
             if is_before_station:
                 order = inlink_orders[seg_i][0]
                 dwell_sec = float(
@@ -558,7 +590,7 @@ def _make_speed_and_coords(
                 cur_v = 0.0
                 did_station_stop_on_link = True
 
-        # 신호등 정차 처리: 마지막 세그먼트에서 이미 0까지 감속했으므로 여기서는 '대기'만
+        # 신호등 대기(마지막 세그먼트에서 이미 0까지 감속)
         if tl_stop_now and not did_station_stop_on_link:
             dwell = tl_base_sec + rng.uniform(-tl_jitter_sec, tl_jitter_sec)
             _append_zero_block(speed_list, coord_list, max(0.0, dwell))
@@ -594,6 +626,15 @@ def create_scenario(payload: ScenarioCreate, db: Session = Depends(get_db)):
     route_length_m = float(sum(float(compute_total_length([lid]) or 0.0) for lid in link_list))
     route_curvature = _compute_route_curvature(db, link_list)
 
+    # 기준 시간대(시) 결정: payload.departure_time의 '시' 사용, 없으면 15시
+    try:
+        ref_hour = int(getattr(payload.departure_time, "hour", 15))
+    except Exception:
+        ref_hour = 15
+
+    # 링크별 vmax(=actual_speed) 조회
+    per_link_vmax = _fetch_per_link_vmax_from_traffic(db, link_list, ref_hour=ref_hour)
+
     speed_list, coord_list = _make_speed_and_coords(
         db=db,
         link_ids=link_list,
@@ -605,6 +646,7 @@ def create_scenario(payload: ScenarioCreate, db: Session = Depends(get_db)):
         tl_base_sec=TL_BASE_SEC,
         tl_jitter_sec=TL_JITTER_SEC,
         seed=None,
+        per_link_vmax=per_link_vmax,
     )
 
     scenario = Scenario(

@@ -47,6 +47,9 @@ Thumbs.db
 # ====================
 # 기타 파일
 # ====================
+bus_oppor_induce_prediction*
+OD*
 test*
+traffic_congest_prediction*
 *.xlsx
 *.html
