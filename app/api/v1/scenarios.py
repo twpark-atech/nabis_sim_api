@@ -1,4 +1,3 @@
-# app/api/v1/scenarios.py
 from __future__ import annotations
 
 from typing import List, Tuple, Dict, Optional
@@ -50,6 +49,19 @@ TRAFFIC_REF_DATE = _date(2025, 8, 1)
 router = APIRouter()
 
 # --------------------------------
+# 공용: 안전한 departure_time 확보 (None 방지)
+# --------------------------------
+def _ensure_departure_time(dt: Optional[datetime]) -> datetime:
+    """
+    payload.departure_time 이 None 인 경우를 대비한 안전장치.
+    규칙(임시): None -> (TRAFFIC_REF_DATE, 15:00)
+    TODO(질문): None 일 때 어떤 기준을 쓸지 확정 필요.
+    """
+    if isinstance(dt, datetime):
+        return dt.replace(microsecond=0)
+    return datetime.combine(TRAFFIC_REF_DATE, _time(15, 0, 0))
+
+# --------------------------------
 # DB: 링크 geometry (WGS84) 가져오기
 # --------------------------------
 def _get_link_geometry_wgs84(db, link_id: int) -> LineString | None:
@@ -75,6 +87,88 @@ def _get_link_geometry_wgs84(db, link_id: int) -> LineString | None:
 
     return None
 
+def _floor_to_5min_slot(dt: datetime) -> datetime:
+    m = (dt.minute // 5) * 5
+    return dt.replace(minute=m, second=0, microsecond=0)
+
+# --------------------------------
+# sim_traffic_congest 에서 roadname 기준 vmax(=MAX(avg_speed)) 조회
+# - LINK_ID -> new_uroad."ROAD_NAME" 매핑
+# - departure_time 을 5분 슬롯으로 내림하여 slot_5min 일치
+# - 동일 roadname 복수 행이면 "최대 속도" 사용 (요구사항 반영)
+# --------------------------------
+def _fetch_per_link_vmax_from_congest_by_roadname(
+    db: Session,
+    link_ids: List[int],
+    departure_time: Optional[datetime],
+) -> Dict[int, float]:
+    if not link_ids:
+        return {}
+
+    # 1) LINK_ID -> ROAD_NAME 매핑
+    lids_text = [str(l) for l in link_ids]
+    q_road = text("""
+        SELECT "LINK_ID"::text AS lid_text, "ROAD_NAME"
+        FROM new_uroad
+        WHERE "LINK_ID"::text = ANY(:lid_list)
+    """)
+    rows = db.execute(q_road, {"lid_list": lids_text}).fetchall()
+
+    lid_to_rn: Dict[int, str] = {}
+    roadnames: List[str] = []
+    for lid_text, rn in rows:
+        try:
+            lid_int = int(lid_text)
+        except Exception:
+            continue
+        if rn is not None:
+            _rn = str(rn).strip()
+            if _rn != "":
+                lid_to_rn[lid_int] = _rn
+                roadnames.append(_rn)
+
+    if not lid_to_rn:
+        return {}
+
+    # 유니크 로드네임만 전달 (ANY 성능/안정성)
+    roadnames = list({r: None for r in roadnames}.keys())
+
+    # 2) slot_5min 결정 (None 방지)
+    base_dt = _ensure_departure_time(departure_time)
+    slot_dt = _floor_to_5min_slot(base_dt)
+
+    # 3) roadname & slot 매칭 → roadname 별 MAX(avg_speed) 사용
+    #    NOTE: text() + ANY(:list) 는 psycopg2 가 배열로 적절히 바인딩함.
+    q_congest = text("""
+        SELECT roadname, MAX(avg_speed)::float AS vmax
+        FROM sim_traffic_congest
+        WHERE roadname = ANY(:rn_list)
+          AND slot_5min = :slot_dt
+        GROUP BY roadname
+    """)
+    crows = db.execute(q_congest, {"rn_list": roadnames, "slot_dt": slot_dt}).fetchall()
+
+    rn_to_speed: Dict[str, float] = {}
+    for rn, vmax in crows:
+        if rn is None or vmax is None:
+            continue
+        try:
+            v = float(vmax)
+        except Exception:
+            continue
+        if v > 0.0:
+            rn_to_speed[str(rn).strip()] = v
+
+    # 4) 링크별 vmax 구성 (없으면 호출부에서 DEFAULT_V_MAX 사용)
+    out: Dict[int, float] = {}
+    for lid in link_ids:
+        rn = lid_to_rn.get(int(lid))
+        if not rn:
+            continue
+        v = rn_to_speed.get(rn)
+        if v is not None and v > 0.0:
+            out[int(lid)] = v
+    return out
 
 # --------------------------------
 # station_list 기반 링크 시퀀스 & 정류장 정차 인덱스
@@ -106,7 +200,6 @@ def _build_links_and_station_stop_indices(
 
     return full_links, stop_idx_to_station_order
 
-
 # --------------------------------
 # 굴곡도 계산 (절대 회전량 합 / 총거리[km])
 # --------------------------------
@@ -130,7 +223,6 @@ def _polyline_turn_sum_radians(line: LineString) -> float:
         prev_h = h
     return float(total)
 
-
 def _compute_route_curvature(db: Session, link_ids: List[int]) -> float:
     if not link_ids:
         return 0.0
@@ -142,7 +234,6 @@ def _compute_route_curvature(db: Session, link_ids: List[int]) -> float:
     total_m = sum(float(compute_total_length([lid]) or 0.0) for lid in link_ids)
     total_km = max(1e-6, total_m / 1000.0)
     return round(turn_sum / total_km, 6)
-
 
 # --------------------------------
 # F_NODE/T_NODE 일괄 조회
@@ -162,7 +253,6 @@ def _fetch_link_nodes(db: Session, link_ids: List[int]) -> Dict[int, Tuple[int |
         out.setdefault(int(lid), (None, None))
     return out
 
-
 # --------------------------------
 # (역주행 허용) 인접 교집합 + lookahead 기반 방향 결정
 # --------------------------------
@@ -172,7 +262,6 @@ def _approx_dist_m(a_xy: tuple[float, float], b_xy: tuple[float, float]) -> floa
     dx = (ax - bx) * np.cos(np.deg2rad((ay + by) * 0.5))
     dy = (ay - by)
     return float(np.hypot(dx, dy) * 111_320.0)
-
 
 def _orient_links_by_intersection(db: Session, link_ids: List[int]) -> List[Tuple[int, bool]]:
     n = len(link_ids)
@@ -270,13 +359,11 @@ def _orient_links_by_intersection(db: Session, link_ids: List[int]) -> List[Tupl
     flips = [bool(f) if f is not None else False for f in flips]
     return list(zip(link_ids, flips))
 
-
 # --------------------------------
 # 속도/거리 유틸
 # --------------------------------
 def _ticks_from_seconds(sec: float, dt: float = DT) -> int:
     return max(0, int(round(sec / dt)))
-
 
 def _cum_dists_from_speeds_kmh(speeds: List[float], dt: float = DT) -> np.ndarray:
     if not speeds:
@@ -287,7 +374,6 @@ def _cum_dists_from_speeds_kmh(speeds: List[float], dt: float = DT) -> np.ndarra
     if len(cum) < len(speeds):
         cum = np.pad(cum, (0, len(speeds) - len(cum)), constant_values=cum[-1])
     return cum[: len(speeds)]
-
 
 # --------------------------------
 # ✨ 세그먼트 시뮬레이터 (감속/정지/연속성 보장)
@@ -351,7 +437,6 @@ def _simulate_segment_speeds(
 
     return speeds
 
-
 # --------------------------------
 # 정류장 좌표 조회 (SIM_BIS_BUS_STATION_LOCATION → geometry 생성 → WGS84 좌표 반환)
 # --------------------------------
@@ -372,7 +457,6 @@ def _fetch_station_points(db: Session, station_ids: List[int]) -> Dict[int, tupl
         if lon is not None and lat is not None:
             out[int(sid)] = (float(lon), float(lat))
     return out
-
 
 # --------------------------------
 # 정류장(중간) 정차를 링크 내부 위치(인덱스, ratio)로 매핑
@@ -415,7 +499,6 @@ def _map_stops_to_link_positions(
 
     return stop_pos
 
-
 # --------------------------------
 # (공용) 정차 블록 삽입: 설정 시간만큼 0 반복 + 좌표 고정
 # --------------------------------
@@ -426,7 +509,6 @@ def _append_zero_block(speed_list: List[float], coord_list: List[tuple[float, fl
     last_coord = coord_list[-1] if coord_list else (0.0, 0.0)
     speed_list.extend([0.0] * ticks)
     coord_list.extend([last_coord] * ticks)
-
 
 # --------------------------------
 # NEW: uroad_traffic_filled에서 링크별 vmax(=actual_speed) 가져오기
@@ -464,12 +546,12 @@ def _fetch_per_link_vmax_from_traffic(
             out[lid_int] = float(vmax_kmh)
     return out
 
-
 # --------------------------------
 # 속도/좌표 생성 엔진 (링크별 vmax 적용)
 #  - 비정지 구간 시작속도 0 리셋 방지
 #  - 신호등은 링크 마지막 세그먼트를 ‘정지 목표’로 처리 후 대기
-#  - 각 링크 vmax = 교통 테이블 actual_speed(없으면 DEFAULT_V_MAX)
+#  - 각 링크 vmax = 교통 테이블 값(없으면 DEFAULT_V_MAX)
+#  - 🔧 보완: link_vmax 하한값 0.1km/h 적용(0 또는 음수 방지)
 # --------------------------------
 def _make_speed_and_coords(
     db: Session,
@@ -516,8 +598,11 @@ def _make_speed_and_coords(
             geom_cache[lid] = base
         line = geom_cache[lid]
 
-        # 이 링크의 vmax 결정 (교통값 우선, 없으면 기본값)
-        link_vmax = float(max(0.1, per_link_vmax.get(lid, v_max_kmh))) if per_link_vmax else float(v_max_kmh)
+        # 이 링크의 vmax 결정 (교통값 우선, 없으면 기본값) + 하한 0.1km/h
+        if per_link_vmax and lid in per_link_vmax:
+            link_vmax = max(0.1, float(per_link_vmax[lid]))
+        else:
+            link_vmax = max(0.1, float(v_max_kmh))
 
         # 신호등 멈춤 여부 선결정
         try:
@@ -597,6 +682,76 @@ def _make_speed_and_coords(
 
     return speed_list, coord_list
 
+def post_speed_list_adjust_backward(speed_list: List[float], a_dec: float = 0.72) -> List[float]:
+    n = len(speed_list)
+    if n <= 1:
+        return speed_list
+    s = list(speed_list)
+    for i in range(n - 2, -1, -1):
+        cap = s[i + 1] + a_dec
+        if s[i] > cap:
+            s[i] = round(cap, 2)
+    return s
+
+def rebuild_coords_from_speed_list(
+    db,
+    link_ids: List[int],
+    speed_list: List[float],
+    dt: float = DT,  # 0.1s
+) -> List[Tuple[float, float]]:
+    # 1) 링크를 실제 진행 방향으로 정렬/뒤집기
+    oriented = _orient_links_by_intersection(db, link_ids)  # [(lid, flip)]
+
+    # 2) 링크별 geometry와 실제 길이(m) 확보
+    geoms: List[LineString] = []
+    lens_m: List[float] = []
+    for lid, flip in oriented:
+        g = _get_link_geometry_wgs84(db, lid)
+        if g is None or len(g.coords) < 2:
+            continue
+        if flip:
+            g = LineString(list(g.coords)[::-1])
+        L = float(compute_total_length([lid]) or 0.0)
+        if L <= 0.0:
+            continue
+        geoms.append(g)
+        lens_m.append(L)
+    if not geoms:
+        return [(0.0, 0.0)] * len(speed_list)
+
+    cum_link_m = np.cumsum(lens_m)  # 각 링크 끝까지의 누적(m)
+    total_path_m = float(cum_link_m[-1])
+
+    # 3) 바뀐 speed_list로부터 틱별 누적 이동거리(m) 계산
+    def _cum_dists_from_speeds_kmh_local(speeds: List[float], dt: float) -> np.ndarray:
+        if not speeds:
+            return np.array([], dtype=float)
+        v = np.array(speeds, dtype=float) / 3.6  # m/s
+        if len(v) == 1:
+            return np.array([0.0], dtype=float)
+        step = (v[:-1] + v[1:]) * 0.5 * dt
+        cum = np.concatenate([[0.0], np.cumsum(step)])
+        return cum
+
+    cum_m = _cum_dists_from_speeds_kmh_local(speed_list, dt=dt)
+    # 경로 총길이 초과분은 말단에 클램프
+    cum_m = np.clip(cum_m, 0.0, total_path_m)
+
+    # 4) 각 누적거리 위치를 (어느 링크, 링크 내 ratio)로 변환 후 좌표 샘플
+    coords: List[Tuple[float, float]] = []
+    li = 0  # 현재 링크 인덱스 포인터
+    for d in cum_m:
+        while li < len(cum_link_m) - 1 and d > cum_link_m[li] + 1e-9:
+            li += 1
+        link_start_m = float(cum_link_m[li - 1]) if li > 0 else 0.0
+        link_len_m = float(lens_m[li])
+        inside_m = float(d - link_start_m)
+        r = inside_m / max(1e-9, link_len_m)
+        r = float(np.clip(r, 0.0 + EPS_RATIO, 1.0 - EPS_RATIO))
+        pt = geoms[li].interpolate(r, normalized=True)
+        coords.append((float(pt.x), float(pt.y)))
+
+    return coords
 
 # --------------------------------
 # FastAPI 엔드포인트
@@ -625,14 +780,15 @@ def create_scenario(payload: ScenarioCreate, db: Session = Depends(get_db)):
     route_length_m = float(sum(float(compute_total_length([lid]) or 0.0) for lid in link_list))
     route_curvature = _compute_route_curvature(db, link_list)
 
-    # 기준 시간대(시) 결정: payload.departure_time의 '시' 사용, 없으면 15시
-    try:
-        ref_hour = int(getattr(payload.departure_time, "hour", 15))
-    except Exception:
-        ref_hour = 15
+    # 안전한 departure_time 확보 (None 방지)
+    safe_departure = _ensure_departure_time(payload.departure_time)
 
-    # 링크별 vmax(=actual_speed) 조회
-    per_link_vmax = _fetch_per_link_vmax_from_traffic(db, link_list, ref_hour=ref_hour)
+    # 링크별 vmax(=최대 avg_speed) 조회: sim_traffic_congest 기준 (roadname 매칭)
+    per_link_vmax = _fetch_per_link_vmax_from_congest_by_roadname(
+        db=db,
+        link_ids=link_list,
+        departure_time=safe_departure,
+    )
 
     speed_list, coord_list = _make_speed_and_coords(
         db=db,
@@ -648,13 +804,22 @@ def create_scenario(payload: ScenarioCreate, db: Session = Depends(get_db)):
         per_link_vmax=per_link_vmax,
     )
 
+    # 후방 감속 캡 보정 + 좌표 재구성(물리 일관성)
+    speed_list = post_speed_list_adjust_backward(speed_list, a_dec=0.72)
+    coord_list = rebuild_coords_from_speed_list(
+        db=db,
+        link_ids=link_list,
+        speed_list=speed_list,
+        dt=DT,
+    )
+
     scenario = Scenario(
         name=payload.name,
         route_id=payload.route_id,
         headway_min=payload.headway_min,
         start_time=payload.start_time,
         end_time=payload.end_time,
-        departure_time=payload.departure_time,
+        departure_time=safe_departure,
         path_type=payload.path_type,
         route_length=route_length_m,
         route_curvature=route_curvature,
