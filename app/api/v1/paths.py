@@ -413,7 +413,7 @@ def compute_links_via_router(
         raise HTTPException(status_code=422, detail="empty link_list from router")
 
     # link_id가 None 포함될 수 있어 필터링 + 정수화
-    out = [int(x) for x in res.links if x is not None]
+    out = [str(x) for x in res.links if x is not None]
     if not out:
         raise HTTPException(status_code=422, detail="no valid link ids")
     return out
