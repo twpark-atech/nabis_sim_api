@@ -56,8 +56,8 @@ def create_scenario(payload: ScenarioCreate, db: Session = Depends(get_db)) -> R
             end_time=payload.end_time,
             departure_time=payload.departure_time,
             path_type=payload.path_type,
+            existing_list=payload.existing_list,
             status="생성 중",
-            # 결과 컬럼들은 Celery가 채움 (NULL 허용이어야 함)
         )
         db.add(sc)
 

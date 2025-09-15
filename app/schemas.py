@@ -75,6 +75,7 @@ class ScenarioCreate(BaseModel):
     end_time: time
     departure_time: time
     path_type: PathType
+    existing_list: List[int]
 
 class ScenarioOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -96,3 +97,4 @@ class ScenarioOut(BaseModel):
     coord_list: List[Tuple[float, float]]
     link_list: List[int]
     status: str
+    existing_list: List[int]

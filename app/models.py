@@ -58,6 +58,7 @@ class Scenario(Base):
     route_curvature: Mapped[float | None]  = mapped_column(Float, nullable=True)
     speed_list: Mapped[list[float] | None] = mapped_column(ARRAY(Float), nullable=True)
     coord_list: Mapped[list | None]        = mapped_column(JSONB, nullable=True)
+    existing_list: Mapped[list[int] | None]= mapped_column(ARRAY(BigInteger), nullable=True)
 
     # ✨ 상태 컬럼: "생성 중" → "생성 완료"/"생성 실패"
     status: Mapped[str]             = mapped_column(String(16), nullable=False, default="생성 중", server_default="생성 중")
